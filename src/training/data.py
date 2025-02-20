@@ -37,7 +37,6 @@ def get_text_formatterd_prompts(processor, context_message, input_message, targe
 def get_data_item(processor, context_message, context_images, input_message, target_message):
   input_message['content'] = context_images +  input_message['content']
   input_text, target_text = get_text_formatterd_prompts(processor, context_message, input_message, target_message)
-  print(input_text, target_text)
   image_inputs, _ = process_vision_info([input_message])
   input_ids, pixel_values, image_grid_thw, target_ids = get_tokenized_prompts(processor, input_text, target_text, image_inputs=image_inputs)
   input_ids_concat, target_ids_concat, attention_mask = get_supervised_format(input_ids, target_ids)
