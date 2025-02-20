@@ -9,9 +9,99 @@ from torch.utils.data import Dataset
 from qwen_vl_utils import process_vision_info
 from PIL import Image
 import re
+from transformers import AutoProcessor
 
 from .params import DataArguments
 from .constants import *
+
+def get_supervised_format(input_ids, target_ids, ignore_idx=-100):
+  input_ids_concat = torch.cat([input_ids, target_ids], dim=1).squeeze(0).to(torch.long)
+  target_ids_concat = torch.cat([torch.tensor([ignore_idx] * input_ids.shape[1]), target_ids.squeeze(0)],dim=0).to(torch.long)
+  attention_mask = (input_ids_concat > -1000000).to(torch.long)
+  return input_ids_concat, target_ids_concat, attention_mask
+
+def get_tokenized_prompts(processor, input_text, target_text, image_inputs=None):
+  input_prompt_tokenized = processor(text=[input_text], images=image_inputs, videos=None, padding=False, return_tensors='pt')
+  input_ids = input_prompt_tokenized['input_ids']
+  pixel_values = input_prompt_tokenized.get('pixel_values', None)
+  image_grid_thw = input_prompt_tokenized.get('image_grid_thw', None)
+  target_ids = processor.tokenizer(target_text, add_special_tokens=False, padding=False, return_tensors='pt')['input_ids']
+  return input_ids, pixel_values, image_grid_thw, target_ids
+
+def get_text_formatterd_prompts(processor, context_message, input_message, target_message):
+  input_text = processor.apply_chat_template([context_message, input_message], tokenize=False, add_generation_prompt=True)
+  target_text = processor.apply_chat_template([target_message], tokenize=False, add_generation_prompt=False)
+  target_text = "".join(target_text.split('\n')[3:])
+  return input_text, target_text
+
+def get_data_item(processor, context_message, context_images, input_message, target_message):
+  input_message['content'] = context_images +  input_message['content']
+  input_text, target_text = get_text_formatterd_prompts(processor, context_message, input_message, target_message)
+  print(input_text, target_text)
+  image_inputs, _ = process_vision_info([input_message])
+  input_ids, pixel_values, image_grid_thw, target_ids = get_tokenized_prompts(processor, input_text, target_text, image_inputs=image_inputs)
+  input_ids_concat, target_ids_concat, attention_mask = get_supervised_format(input_ids, target_ids)
+  data_item = dict(input_ids=input_ids_concat, labels=target_ids_concat, attention_mask=attention_mask)
+  if image_inputs is not None:
+    data_item['pixel_values'] = pixel_values
+    data_item['image_grid_thw'] = image_grid_thw
+  return data_item
+
+class QEADataset(Dataset):
+
+  def __init__(self, model_id, data_path, context_message_path={}, context_annotated_images_path=[]):
+    """
+    data_path can be a dict or a list couples of dict.
+    each couple is input message and target message.
+    [ (input_message, target_message), .... ].
+    Each message is structured as a Qwen dictionary prompt. (role:..., content: ...)
+    the role needs to be "user" for input and "assistant" for the answer.
+    """
+    self.model_id = model_id
+    
+    # data json
+    self.data_path = data_path
+    if isinstance(data_path, str):
+      if data_path.startswith("http"):
+        list_data_dict = requests.get(data_path).json()
+      else:
+        list_data_dict = json.load(open(data_path, "r"))
+    else:
+      list_data_dict = data_path
+    self.list_data_dict = list_data_dict
+    # context annotated images
+    if isinstance(context_annotated_images_path, str):
+      if context_annotated_images_path.startswith("http"):
+        list_data_dict = requests.get(context_annotated_images_path).json()
+      else:
+        list_data_dict = json.load(open(context_annotated_images_path, "r"))
+    else:
+      context_annotated_images_path = context_annotated_images_path
+    self.context_annotated_images = context_annotated_images_path
+    # context message
+    if isinstance(context_message_path, str):
+      if context_message_path.startswith("http"):
+        list_data_dict = requests.get(context_message_path).json()
+      else:
+        list_data_dict = json.load(open(context_message_path, "r"))
+    else:
+      context_message = context_message_path
+    self.context_message = context_message
+    # The default setting is padding_side="left" # When training using the right-side padding is more efficient
+    self.processor = AutoProcessor.from_pretrained(model_id, padding_side="right") 
+    self.buffered_data = {}
+  
+  def __len__(self):
+    return len(self.list_data_dict)
+
+  def __getitem__(self, idx):
+    if idx in self.buffered_data: return self.buffered_data[idx]
+    input_message, target_message = self.list_data_dict[idx]
+    context_message = self.context_message
+    context_annotated_images = self.context_annotated_images  
+    data_item = get_data_item(self.processor, context_message, context_annotated_images, input_message, target_message)
+    self.buffered_data[idx] = data_item
+    return data_item
 
 def truncate_sequence(input_ids, labels, max_length, eos_token_id):
     if input_ids.size(0) > max_length:
